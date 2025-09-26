@@ -1,0 +1,23 @@
+FastAPI (API)
+    ↓
+Handles upload with python-multipart + aiofiles
+    ↓
+Extracts text from PDF using pdfplumber / PyMuPDF
+    ↓
+Keyphrase extraction with rake-nltk (optional)
+    ↓
+Get embeddings via Gemini (google-generativeai)
+    ↓
+Store vectors in Pinecone (pinecone-client)
+    ↓
+Track users / progress in PostgreSQL (SQLAlchemy + psycopg2-binary + alembic)
+    ↓
+Background tasks with Celery + Redis
+    ↓
+Config managed via python-dotenv
+    ↓
+Test everything with pytest
+
+"ALL THE DATABASE SCHEMAS WETHER FOR POSTGRES OR PINECONE GOES HERE"
+
+
