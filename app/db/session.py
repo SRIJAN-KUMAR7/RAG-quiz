@@ -1,15 +1,16 @@
-import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from app.config.settings import settings
+from sqlalchemy.ext.declarative import declarative_base
 
-DATABASE_URL=os.getenv("DATABASE_URL","")
+engine = create_engine(settings.database_url, pool_pre_ping=True)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-engine=create_engine(DATABASE_URL,pool_pre_ping=True)
-SessionLocal=sessionmaker(autoflush=False,bind=engine,autocommit=False)
+Base = declarative_base()
 
 def get_db():
-    db=SessionLocal()
+    db = SessionLocal()
     try:
         yield db
     finally:
-        db.close();
+        db.close()
