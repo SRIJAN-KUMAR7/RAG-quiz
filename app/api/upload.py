@@ -15,7 +15,7 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 router = APIRouter()
 
-# Use a hardcoded dummy user
+# Using a hardcoded dummy user
 DUMMY_USER_ID = "dummy-user-1"
 
 @router.post("/")
