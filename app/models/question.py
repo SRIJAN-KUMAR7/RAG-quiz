@@ -1,11 +1,13 @@
 from sqlalchemy import Column, String, JSON, DateTime, ForeignKey
 from sqlalchemy.sql import func
+from sqlalchemy.dialects.postgresql import UUID
+import uuid
 from app.db.session import Base
 
 class Question(Base):
     __tablename__ = "questions"
-    
-    id = Column(String, primary_key=True)
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     document_id = Column(String, ForeignKey("documents.id"), index=True)
     question_type = Column(String)  # mcq / match / desc
     question_text = Column(String)
@@ -16,7 +18,7 @@ class Question(Base):
 
     def to_dict(self):
         return {
-            "id": self.id,
+            "id": str(self.id),  
             "document_id": self.document_id,
             "type": self.question_type,
             "question_text": self.question_text,
