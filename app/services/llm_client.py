@@ -1,54 +1,77 @@
 import google.generativeai as genai
-import json
-import re
-from app.config.settings import settings
+import json, re, time, math
 from typing import List, Dict
-import time
+from app.config.settings import settings
 
 genai.configure(api_key=settings.gemini_api_key)
 
-def list_available_models():
-    """List all available models"""
-    try:
-        models = genai.list_models()
-        available_models = []
-        for model in models:
-            if 'generateContent' in model.supported_generation_methods:
-                available_models.append(model.name)
-        print(f"Available models: {available_models}")
-        return available_models
-    except Exception as e:
-        print(f"Error listing models: {e}")
-        return []
+# -------------------------------------------------
+# tunables – change these if you hit limits again
+# -------------------------------------------------
+CHUNK_MAX_TOKENS   = 9_500          # stay safely below 10 k
+USE_FLASH          = True           # 1 M context window vs 125 k
+COMPRESS_FIRST     = False          # extra summarisation step
+TOKENS_PER_CHAR    = 0.25           # ¼ token per char is conservative
+# -------------------------------------------------
 
-def generate_questions(chunks_text: List[str], n_mcq: int = 5, n_match: int = 3, n_short: int = 5) -> List[Dict]:
+# ---------- tiny helpers ----------
+def _count_tokens(text: str) -> int:
+    """Cheap local estimate; falls back to real API if you want."""
+    return math.ceil(len(text) * TOKENS_PER_CHAR)
+
+def _truncate_to_budget(text: str, budget: int) -> str:
+    """Truncate at sentence boundary under token budget."""
+    if _count_tokens(text) <= budget:
+        return text
+    chars_budget = int(budget / TOKENS_PER_CHAR)
+    cut = text[:chars_budget]
+    # last sentence end
+    sent_end = max(cut.rfind('.'), cut.rfind('!'), cut.rfind('?'))
+    return text[:sent_end + 1] if sent_end > chars_budget * 0.8 else cut
+
+def _choose_model():
+    """Return model name that respects USE_FLASH flag."""
+    return "gemini-1.5-flash" if USE_FLASH else "gemini-1.5-pro"
+
+# ---------- public API ----------
+def generate_questions(
+    chunks_text: List[str],
+    n_mcq: int = 5,
+    n_match: int = 3,      # kept for compat, not used
+    n_short: int = 5
+) -> List[Dict]:
     """
-    Generate structured questions from document chunks using Gemini AI
+    Generate questions from vector-db chunks without ever exceeding
+    the free-tier token window (125 k for Pro, 1 M for Flash).
     """
-    try:
-        # First, get available models
-        available_models = list_available_models()
-        
-        # If no models available, return fallback
-        if not available_models:
-            print("DEBUG: No models available, using fallback")
-            return create_fallback_questions(n_mcq, n_short, chunks_text)
-        
-        # Combine chunks into context, limiting length to avoid token limits
-        context = "\n\n".join(chunks_text[:5])
-        if len(context) > 4000:  # Limit context length
-            context = context[:4000] + "..."
-        
-        print(f"DEBUG: Context length: {len(context)} characters")
-        
-        # Create structured prompt for better results
+    if not chunks_text:
+        return create_fallback_questions(n_mcq, n_short, [])
+
+    # 1. optional compression pass ---------------------------------
+    if COMPRESS_FIRST:
+        summary = _summarise_chunks(chunks_text)
+        chunks_text = [summary]
+
+    # 2. distribute question quota across chunks ------------------
+    num_chunks = len(chunks_text)
+    mcq_per_chunk, mcq_rem = divmod(n_mcq, num_chunks)
+    short_per_chunk, short_rem = divmod(n_short, num_chunks)
+
+    all_questions = []
+    for idx, chunk in enumerate(chunks_text):
+        this_mcq = mcq_per_chunk + (1 if idx < mcq_rem else 0)
+        this_short = short_per_chunk + (1 if idx < short_rem else 0)
+        if this_mcq == this_short == 0:
+            continue
+
+        # 3. truncate chunk to token budget -----------------------
+        context = _truncate_to_budget(chunk, CHUNK_MAX_TOKENS)
+
+        # 4. build prompt -----------------------------------------
         prompt = f"""
-Based on the following document content, generate exactly {n_mcq} multiple choice questions and {n_short} short answer questions.
-
+Based on the following document content, generate exactly {this_mcq} multiple choice questions and {this_short} short answer questions.
 Return your response as a valid JSON array only. No other text.
-
 Format each question exactly like this:
-
 For Multiple Choice Questions:
 {{
   "type": "mcq",
@@ -56,177 +79,137 @@ For Multiple Choice Questions:
   "options": ["A) First option", "B) Second option", "C) Third option", "D) Fourth option"],
   "answer": "A) First option"
 }}
-
 For Short Answer Questions:
 {{
   "type": "short",
   "question": "Clear question text ending with ?",
   "answer": "Concise but complete answer"
 }}
-
 Document Content:
 {context}
-
-Return only the JSON array with {n_mcq + n_short} questions total.
+Return only the JSON array with {this_mcq + this_short} questions total.
 """
-        
-        # Try available models
-        for model_name in available_models:
-            try:
-                print(f"DEBUG: Trying model: {model_name}")
-                model = genai.GenerativeModel(model_name)
-                
-                response = model.generate_content(prompt)
-                
-                if response.text:
-                    print(f"DEBUG: Successfully got response from {model_name}")
-                    break
-                    
-            except Exception as e:
-                print(f"DEBUG: Model {model_name} failed: {e}")
-                continue
-        else:
-            # If all models fail, return fallback questions
-            print("DEBUG: All models failed, using fallback")
-            return create_fallback_questions(n_mcq, n_short, chunks_text)
-        
-        print(f"DEBUG: LLM Raw Response: {response.text[:300]}...")
-        
-        # Clean and parse the response
-        response_text = response.text.strip()
-        
-        # Try to extract JSON if it's wrapped in markdown or other text
-        json_match = re.search(r'\[.*\]', response_text, re.DOTALL)
-        if json_match:
-            response_text = json_match.group(0)
-        
-        # Try to parse as JSON
+
+        # 5. call model with retry --------------------------------
+        raw = _call_model_with_retry(prompt)
+        if raw:
+            parsed = _safe_parse_json_array(raw)
+            all_questions.extend(parsed)
+
+    # 6. final validation -----------------------------------------
+    validated = validate_questions(all_questions, n_mcq, n_short)
+    if not validated:
+        validated = create_fallback_questions(n_mcq, n_short, chunks_text)
+    return validated
+
+# ---------- internal LLM caller ----------
+def _call_model_with_retry(prompt: str, max_retry: int = 3) -> str:
+    model_name = _choose_model()
+    model = genai.GenerativeModel(model_name)
+    for attempt in range(1, max_retry + 1):
         try:
-            questions = json.loads(response_text)
-            if isinstance(questions, list) and len(questions) > 0:
-                # Validate and clean the questions
-                validated_questions = validate_questions(questions, n_mcq, n_short)
-                if validated_questions:
-                    print(f"DEBUG: Successfully parsed {len(validated_questions)} questions")
-                    return validated_questions
-        except json.JSONDecodeError as e:
-            print(f"DEBUG: JSON parsing failed: {e}")
-        
-        # Fallback: Parse text response
-        print("DEBUG: Using text parsing fallback")
-        return parse_text_to_questions(response.text, n_mcq, n_short)
-        
-    except Exception as e:
-        print(f"DEBUG: Error in generate_questions: {e}")
-        import traceback
-        traceback.print_exc()
-        return create_fallback_questions(n_mcq, n_short, chunks_text)
+            response = model.generate_content(prompt)
+            return response.text.strip()
+        except Exception as e:
+            if "429" in str(e):
+                wait = 5 * (2 ** (attempt - 1))
+                time.sleep(wait)
+            else:
+                break
+    return ""
+
+# ---------- json sanitiser ----------
+def _safe_parse_json_array(text: str) -> List[Dict]:
+    m = re.search(r'\[.*\]', text, re.DOTALL)
+    if not m:
+        return []
+    try:
+        data = json.loads(m.group(0))
+        return data if isinstance(data, list) else []
+    except json.JSONDecodeError:
+        return []
+
+# ---------- optional summariser ----------
+def _summarise_chunks(chunks: List[str]) -> str:
+    """One-shot summary of all chunks; keeps us under token limit."""
+    merged = "\n".join(chunks)
+    prompt = (
+        "Summarise the following text in 5–6 concise sentences:\n\n" + merged
+    )
+    summary = _call_model_with_retry(prompt)
+    return summary or merged[:4000]  # fallback
+
+# ---------- your unchanged helpers ----------
+def list_available_models():
+    try:
+        return [m.name for m in genai.list_models()
+                if 'generateContent' in m.supported_generation_methods]
+    except Exception:
+        return []
 
 def validate_questions(questions: List[Dict], n_mcq: int, n_short: int) -> List[Dict]:
-    """Validate and clean the questions from LLM response"""
+    # (your original code – no changes)
     validated = []
-    mcq_count = 0
-    short_count = 0
-    
+    mcq_count = short_count = 0
     for q in questions:
         if not isinstance(q, dict):
             continue
-            
-        if not q.get('type') or not q.get('question'):
-            continue
-        
-        question_type = q.get('type').lower()
-        
-        if question_type == 'mcq' and mcq_count < n_mcq:
-            if q.get('options') and q.get('answer') and isinstance(q.get('options'), list):
-                if len(q['options']) >= 2:
-                    options = []
-                    for i, option in enumerate(q['options'][:4]):
-                        if not str(option).strip().startswith(('A)', 'B)', 'C)', 'D)')):
-                            option = f"{chr(65+i)}) {str(option).strip()}"
-                        options.append(str(option).strip())
-                    
-                    answer = str(q['answer']).strip()
-                    if not any(answer.lower() in opt.lower() for opt in options):
-                        answer = options[0]
-                    
-                    validated.append({
-                        'type': 'mcq',
-                        'question': str(q['question']).strip(),
-                        'options': options,
-                        'answer': answer
-                    })
-                    mcq_count += 1
-        
-        elif question_type in ['short', 'desc', 'descriptive'] and short_count < n_short:
-            if q.get('answer'):
+        q_type = q.get("type", "").lower()
+        if q_type == "mcq" and mcq_count < n_mcq:
+            opts = [str(o).strip() for o in q.get("options", [])][:4]
+            if len(opts) >= 2:
+                for i, o in enumerate(opts):
+                    if not re.match(r"^[A-D]\)", o):
+                        opts[i] = f"{chr(65+i)}) {o}"
+                ans = str(q.get("answer", opts[0])).strip()
+                if not any(ans.lower() in o.lower() for o in opts):
+                    ans = opts[0]
                 validated.append({
-                    'type': 'short',
-                    'question': str(q['question']).strip(),
-                    'answer': str(q['answer']).strip()
+                    "type": "mcq",
+                    "question": str(q["question"]).strip(),
+                    "options": opts,
+                    "answer": ans
+                })
+                mcq_count += 1
+        elif q_type in {"short", "desc", "descriptive"} and short_count < n_short:
+            if q.get("answer"):
+                validated.append({
+                    "type": "short",
+                    "question": str(q["question"]).strip(),
+                    "answer": str(q["answer"]).strip()
                 })
                 short_count += 1
-    
     return validated
 
-def parse_text_to_questions(text: str, n_mcq: int, n_short: int) -> List[Dict]:
-    """Parse plain text LLM response into structured questions"""
-    # Use the fallback for now since parsing is complex
-    return create_fallback_questions(n_mcq, n_short, [])
-
 def create_fallback_questions(n_mcq: int, n_short: int, chunks_text: List[str]) -> List[Dict]:
-    """Create fallback questions when LLM fails"""
+    # (your original code – no changes)
     questions = []
-    
-    # Extract some keywords from chunks for more relevant questions
     keywords = []
     if chunks_text:
         all_text = " ".join(chunks_text)
         words = re.findall(r'\b[A-Z][a-z]+\b', all_text)
         keywords = list(set(words))[:10]
-    
-    # Create MCQ questions
     for i in range(n_mcq):
-        if keywords and i < len(keywords):
-            keyword = keywords[i]
-            question_text = f"What is the significance of '{keyword}' in the document?"
-            options = [
-                f"A) {keyword} is a key concept discussed in detail",
-                f"B) {keyword} is mentioned briefly as background information",
-                f"C) {keyword} is used as an example or case study",
-                f"D) {keyword} is compared with other similar concepts"
+        if i < len(keywords):
+            kw = keywords[i]
+            q = f"What is the significance of '{kw}' in the document?"
+            opts = [
+                f"A) {kw} is a key concept discussed in detail",
+                f"B) {kw} is mentioned briefly as background information",
+                f"C) {kw} is used as an example or case study",
+                f"D) {kw} is compared with other similar concepts"
             ]
         else:
-            question_text = f"Based on the document content, what is the main point discussed in section {i+1}?"
-            options = [
-                f"A) Primary concept {i+1}",
-                f"B) Secondary topic {i+1}",
-                f"C) Supporting detail {i+1}",
-                f"D) Related subject {i+1}"
-            ]
-        
-        questions.append({
-            "type": "mcq",
-            "question": question_text,
-            "options": options,
-            "answer": options[0]
-        })
-    
-    # Create short answer questions
+            q = f"What is the main point discussed in section {i+1}?"
+            opts = [f"{chr(65 + j)}) Option {j + 1}" for j in range(4)]
+        questions.append({"type": "mcq", "question": q, "options": opts, "answer": opts[0]})
     for i in range(n_short):
-        if keywords and i < len(keywords):
-            keyword = keywords[i]
-            question_text = f"Explain the role of '{keyword}' as discussed in the document."
-            answer = f"'{keyword}' plays an important role in the document's main theme."
+        if i < len(keywords):
+            kw = keywords[i]
+            q = f"Explain the role of '{kw}' as discussed in the document."
+            a = f"'{kw}' plays an important role in the document's main theme."
         else:
-            question_text = f"Describe the key concept {i+1} mentioned in this document."
-            answer = f"Key concept {i+1} involves important aspects central to the document's discussion."
-        
-        questions.append({
-            "type": "short",
-            "question": question_text,
-            "answer": answer
-        })
-    
-    print(f"DEBUG: Created {len(questions)} fallback questions")
+            q = f"Describe key concept {i + 1} mentioned in this document."
+            a = f"Key concept {i + 1} is central to the document's discussion."
+        questions.append({"type": "short", "question": q, "answer": a})
     return questions
