@@ -6,6 +6,7 @@ from app.services.vector_db import init_pinecone
 from app.db.session import Base, engine
 from app.api import questions
 from app.models import document, progress, question, user
+from app.api import skillquestion
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -32,6 +33,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 app.include_router(upload.router, prefix="/upload", tags=["upload"])
 app.include_router(questions.router, prefix="/questions", tags=["questions"]) 
+app.include_router(skillquestion.router,prefix="/skill",tags=["skillquestion"])
 
 @app.get("/")
 def read_root():

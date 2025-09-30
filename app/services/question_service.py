@@ -56,7 +56,6 @@ def trigger_generate_questions(
         generated_questions = llm_client.generate_questions(
             chunks_text=chunks_text,
             n_mcq=n_mcq,
-            n_match=n_match,
             n_short=n_short,
         )
 

@@ -2,57 +2,58 @@ import google.generativeai as genai
 import json, re, time, math
 from typing import List, Dict
 from app.config.settings import settings
+import logging
 
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+# Configure Gemini once
+logger.debug("[DEBUG] Configuring Gemini API…")
 genai.configure(api_key=settings.gemini_api_key)
 
 # -------------------------------------------------
-# tunables – change these if you hit limits again
-# -------------------------------------------------
-CHUNK_MAX_TOKENS   = 9_500          # stay safely below 10 k
-USE_FLASH          = True           # 1 M context window vs 125 k
-COMPRESS_FIRST     = False          # extra summarisation step
-TOKENS_PER_CHAR    = 0.25           # ¼ token per char is conservative
+CHUNK_MAX_TOKENS   = 9_500
+USE_FLASH          = True
+COMPRESS_FIRST     = False
+TOKENS_PER_CHAR    = 0.25
 # -------------------------------------------------
 
-# ---------- tiny helpers ----------
 def _count_tokens(text: str) -> int:
-    """Cheap local estimate; falls back to real API if you want."""
     return math.ceil(len(text) * TOKENS_PER_CHAR)
 
 def _truncate_to_budget(text: str, budget: int) -> str:
-    """Truncate at sentence boundary under token budget."""
     if _count_tokens(text) <= budget:
         return text
     chars_budget = int(budget / TOKENS_PER_CHAR)
     cut = text[:chars_budget]
-    # last sentence end
     sent_end = max(cut.rfind('.'), cut.rfind('!'), cut.rfind('?'))
-    return text[:sent_end + 1] if sent_end > chars_budget * 0.8 else cut
+    truncated = text[:sent_end + 1] if sent_end > chars_budget * 0.8 else cut
+    logger.debug(f"[DEBUG] Truncated chunk from {len(text)} chars to {len(truncated)} chars")
+    return truncated
 
-def _choose_model():
-    """Return model name that respects USE_FLASH flag."""
-    return "gemini-1.5-flash" if USE_FLASH else "gemini-1.5-pro"
+def _choose_model() -> str:
+    if USE_FLASH:
+        model = "gemini-2.5-flash"  # fastest model for text generation
+    else:
+        model = "gemini-2.5-pro"    #models/chat-bison
+    logger.debug(f"[DEBUG] Using Gemini model: {model}")
+    return model
 
-# ---------- public API ----------
-def generate_questions(
-    chunks_text: List[str],
-    n_mcq: int = 5,
-    n_match: int = 3,      # kept for compat, not used
-    n_short: int = 5
-) -> List[Dict]:
+
+def generate_questions(chunks_text: List[str], n_mcq: int = 5, n_short: int = 5) -> List[Dict]:
     """
-    Generate questions from vector-db chunks without ever exceeding
-    the free-tier token window (125 k for Pro, 1 M for Flash).
+    Generate MCQ + short questions from text chunks.
     """
+    logger.debug(f"[DEBUG] generate_questions called with {len(chunks_text)} chunks.")
     if not chunks_text:
+        logger.debug("[DEBUG] No chunks passed, returning fallback questions.")
         return create_fallback_questions(n_mcq, n_short, [])
 
-    # 1. optional compression pass ---------------------------------
     if COMPRESS_FIRST:
+        logger.debug("[DEBUG] Running summarisation pass on chunks.")
         summary = _summarise_chunks(chunks_text)
         chunks_text = [summary]
 
-    # 2. distribute question quota across chunks ------------------
     num_chunks = len(chunks_text)
     mcq_per_chunk, mcq_rem = divmod(n_mcq, num_chunks)
     short_per_chunk, short_rem = divmod(n_short, num_chunks)
@@ -64,88 +65,93 @@ def generate_questions(
         if this_mcq == this_short == 0:
             continue
 
-        # 3. truncate chunk to token budget -----------------------
         context = _truncate_to_budget(chunk, CHUNK_MAX_TOKENS)
+        logger.debug(f"[DEBUG] Generating {this_mcq} MCQ and {this_short} short questions from chunk {idx+1}/{num_chunks}")
 
-        # 4. build prompt -----------------------------------------
+     #PROMPT FOR LLM  
         prompt = f"""
 Based on the following document content, generate exactly {this_mcq} multiple choice questions and {this_short} short answer questions.
 Return your response as a valid JSON array only. No other text.
+
 Format each question exactly like this:
+
 For Multiple Choice Questions:
 {{
   "type": "mcq",
   "question": "Clear question text ending with ?",
-  "options": ["A) First option", "B) Second option", "C) Third option", "D) Fourth option"],
-  "answer": "A) First option"
+  "options": [
+    "A) First option",
+    "B) Second option",
+    "C) Third option",
+    "D) Fourth option"
+  ],
+  "answer": "One of the options above that is actually correct"
 }}
+
 For Short Answer Questions:
 {{
   "type": "short",
   "question": "Clear question text ending with ?",
   "answer": "Concise but complete answer"
 }}
+
 Document Content:
 {context}
+
 Return only the JSON array with {this_mcq + this_short} questions total.
 """
-
-        # 5. call model with retry --------------------------------
+       
+       
+       
+       
         raw = _call_model_with_retry(prompt)
-        if raw:
-            parsed = _safe_parse_json_array(raw)
-            all_questions.extend(parsed)
+        parsed = _safe_parse_json_array(raw)
+        all_questions.extend(parsed)
 
-    # 6. final validation -----------------------------------------
     validated = validate_questions(all_questions, n_mcq, n_short)
     if not validated:
+        logger.debug("[DEBUG] Model returned no valid questions, falling back.")
         validated = create_fallback_questions(n_mcq, n_short, chunks_text)
+    logger.debug(f"[DEBUG] Returning {len(validated)} validated questions.")
     return validated
 
-# ---------- internal LLM caller ----------
 def _call_model_with_retry(prompt: str, max_retry: int = 3) -> str:
     model_name = _choose_model()
     model = genai.GenerativeModel(model_name)
     for attempt in range(1, max_retry + 1):
         try:
+            logger.debug(f"[DEBUG] Gemini call attempt {attempt}")
             response = model.generate_content(prompt)
+            logger.debug(f"[DEBUG] Gemini responded with {len(response.text)} chars")
             return response.text.strip()
         except Exception as e:
+            logger.exception(f"[DEBUG] Gemini API error: {e}")
             if "429" in str(e):
                 wait = 5 * (2 ** (attempt - 1))
+                logger.debug(f"[DEBUG] Rate limited, sleeping {wait}s")
                 time.sleep(wait)
             else:
                 break
     return ""
 
-# ---------- json sanitiser ----------
 def _safe_parse_json_array(text: str) -> List[Dict]:
     m = re.search(r'\[.*\]', text, re.DOTALL)
     if not m:
+        logger.debug("[DEBUG] No JSON array found in model output.")
         return []
     try:
         data = json.loads(m.group(0))
         return data if isinstance(data, list) else []
     except json.JSONDecodeError:
+        logger.debug("[DEBUG] JSON decode error in model output.")
         return []
 
-# ---------- optional summariser ----------
 def _summarise_chunks(chunks: List[str]) -> str:
-    """One-shot summary of all chunks; keeps us under token limit."""
     merged = "\n".join(chunks)
-    prompt = (
-        "Summarise the following text in 5–6 concise sentences:\n\n" + merged
-    )
+    prompt = "Summarise the following text in 5–6 concise sentences:\n\n" + merged
     summary = _call_model_with_retry(prompt)
-    return summary or merged[:4000]  # fallback
+    return summary or merged[:4000]
 
-# ---------- your unchanged helpers ----------
-def list_available_models():
-    try:
-        return [m.name for m in genai.list_models()
-                if 'generateContent' in m.supported_generation_methods]
-    except Exception:
-        return []
 
 def validate_questions(questions: List[Dict], n_mcq: int, n_short: int) -> List[Dict]:
     # (your original code – no changes)
