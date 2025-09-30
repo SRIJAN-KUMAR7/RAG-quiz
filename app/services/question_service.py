@@ -68,9 +68,8 @@ def trigger_generate_questions(
         for i, q in enumerate(generated_questions):
             try:
                 question = Question(
-                    id=str(uuid.uuid4()),  # Ensure string format
-                    document_id=str(document_id),  # Ensure string format
-                    question_type=q["type"],  
+                    document_id=str(document_id),
+                    question_type=q["type"],
                     question_text=q["question"],
                     options=q.get("options"),
                     answer=q.get("answer")

@@ -1,6 +1,4 @@
-
-from typing import List
-from fastapi import APIRouter, Depends, HTTPException, Body
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
@@ -25,7 +23,7 @@ def list_questions(document_id: str, db: Session = Depends(get_db)):
     return {"document_id": document_id, "questions": questions}
 
 @router.post("/generate")
-def generate_questions(payload: GenerateRequest, db: Session = Depends(get_db)):
+def generate_questions_endpoint(payload: GenerateRequest, db: Session = Depends(get_db)):
     """
     Trigger generation of new questions for a document.
     """
@@ -41,6 +39,7 @@ def generate_questions(payload: GenerateRequest, db: Session = Depends(get_db)):
         if not success:
             raise HTTPException(status_code=500, detail="Question generation failed")
         return {"status": "started", "document_id": payload.document_id}
+    
     except Exception as e:
         print(f"DEBUG: Exception in generate_questions: {e}")
         import traceback
