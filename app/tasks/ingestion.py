@@ -1,5 +1,3 @@
-# app/tasks/ingestion.py
-import uuid
 from app.services.extraction import extract_full_text
 from app.services.chunking import chunk_text
 from app.services.embeddings import get_embeddings

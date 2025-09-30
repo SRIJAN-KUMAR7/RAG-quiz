@@ -14,7 +14,7 @@ class AnswerPayload(BaseModel):
     user_id: str
     document_id: str
     question_id: str
-    answer: Dict   # For MCQ: {"selected_index": 1}; For short: {"text": "..."}
+    answer: Dict
     elapsed_seconds: Optional[int] = None
 
 import uuid

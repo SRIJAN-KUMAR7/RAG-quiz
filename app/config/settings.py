@@ -1,9 +1,8 @@
-# app/config/settings.py
 from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     # Database
-    database_url: str
+    database_url: str = "sqlite:///./quiz.db"
 
     # Gemini API
     gemini_api_key: str
